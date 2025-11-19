@@ -1,0 +1,349 @@
+import os
+import re
+from pathlib import Path
+from PyQt5.QtCore import QThread, pyqtSignal
+import hashlib
+import io
+
+try:
+    from PIL import Image
+    from PIL import ImageDraw, ImageOps
+except ImportError:
+    Image = None
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+
+class SearchWorker(QThread):
+    search_completed = pyqtSignal(list)
+    search_status = pyqtSignal(str)
+    create_widget = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.root_dir = ""
+        self.query = ""
+        self.running = False
+        self.db_folder = None
+        
+        # Media file extensions
+        self.SEQUENCE_EXTENSIONS = {'.exr', '.jpg', '.jpeg', '.png', '.tiff', '.tif'}
+        self.VIDEO_EXTENSIONS = {'.mov', '.mp4', '.mkv', '.avi', '.flv', '.wmv', '.webm', '.m4v', '.mts', '.m2ts'}
+        self.IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+        self.ALL_MEDIA_EXTENSIONS = self.SEQUENCE_EXTENSIONS | self.VIDEO_EXTENSIONS | self.IMAGE_EXTENSIONS
+        # Thumbnail settings
+        self.thumb_size = (160, 90)
+        self.thumb_radius = 12
+
+    def get_image_resolution(self, file_path):
+        """Get image resolution using PIL"""
+        if Image is None:
+            return None
+        try:
+            with Image.open(file_path) as img:
+                return img.size  # Returns (width, height)
+        except Exception as e:
+            print(f"Error reading image {file_path}: {e}")
+            return None
+
+    def get_video_info(self, file_path):
+        """Get video resolution and frame count using OpenCV"""
+        if cv2 is None:
+            return None, None
+        try:
+            cap = cv2.VideoCapture(file_path)
+            if not cap.isOpened():
+                return None, None
+            
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            return (width, height), frame_count
+        except Exception as e:
+            print(f"Error reading video {file_path}: {e}")
+            return None, None
+
+    def get_sequence_info(self, file_path, file_name):
+        """Detect and analyze image sequences (e.g., image.0001.exr)"""
+        try:
+            # Match pattern like filename.#### or filename_#### at the end
+            sequence_pattern = r'^(.+?)[\._](\d{4,})(\.\w+)$'
+            match = re.match(sequence_pattern, file_name)
+            
+            if match:
+                base_name = match.group(1)
+                frame_number = match.group(2)
+                ext = match.group(3)
+                
+                # Get the directory and find all frames in sequence
+                directory = os.path.dirname(file_path)
+                base_pattern = f"{base_name}.*{ext}"
+                
+                # Count frames in sequence
+                frame_count = 0
+                frames = []
+                for f in os.listdir(directory):
+                    if f.startswith(base_name) and f.endswith(ext):
+                        frame_match = re.match(sequence_pattern, f)
+                        if frame_match and frame_match.group(1) == base_name:
+                            frame_count += 1
+                            frames.append(f)
+                
+                # Get resolution from first frame
+                first_frame_path = os.path.join(directory, sorted(frames)[0])
+                resolution = self.get_image_resolution(first_frame_path)
+                
+                return resolution, frame_count, True  # Is sequence
+            
+        except Exception as e:
+            print(f"Error analyzing sequence {file_path}: {e}")
+        
+        return None, None, False
+
+    def ensure_thumbnail_folder(self):
+        """Ensure .db/thumbnails exists and return its path"""
+        if not self.db_folder:
+            return None
+        thumbs = os.path.join(self.db_folder, 'thumbnails')
+        try:
+            os.makedirs(thumbs, exist_ok=True)
+        except Exception:
+            pass
+        return thumbs
+
+    def _thumbnail_name(self, file_path):
+        h = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+        return f"{h}.png"
+
+    def create_placeholder_thumbnail(self, dest_path):
+        """Create an empty 160x90 thumbnail with rounded corners"""
+        if Image is None:
+            # Can't generate image, create an empty file as fallback
+            try:
+                with open(dest_path, 'wb'):
+                    pass
+            except Exception:
+                pass
+            return dest_path
+
+        size = self.thumb_size
+        radius = self.thumb_radius
+        try:
+            bg = Image.new('RGBA', size, (40, 40, 40, 255))
+            # apply rounded corners
+            mask = Image.new('L', size, 0)
+            draw = ImageDraw.Draw(mask)
+            draw.rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
+            bg.putalpha(mask)
+            bg.save(dest_path, format='PNG')
+        except Exception as e:
+            print(f"Error creating placeholder thumbnail: {e}")
+            try:
+                with open(dest_path, 'wb'):
+                    pass
+            except Exception:
+                pass
+        return dest_path
+
+    def apply_rounded_corners(self, img):
+        """Return image with rounded corners applied (RGBA)"""
+        if Image is None:
+            return img
+        size = img.size
+        radius = self.thumb_radius
+        mask = Image.new('L', size, 0)
+        draw = ImageDraw.Draw(mask)
+        draw.rounded_rectangle((0, 0, size[0], size[1]), radius=radius, fill=255)
+        img.putalpha(mask)
+        return img
+
+    def generate_thumbnail(self, file_info):
+        """Generate thumbnail PNG for a given file_info and return path.
+        Uses PIL for images and OpenCV for videos (if available). Falls back to a placeholder.
+        """
+        thumbs_dir = self.ensure_thumbnail_folder()
+        if not thumbs_dir:
+            return None
+
+        thumb_name = self._thumbnail_name(file_info['path'])
+        thumb_path = os.path.join(thumbs_dir, thumb_name)
+
+        # If already exists, return it
+        if os.path.exists(thumb_path):
+            return thumb_path
+
+        # Prefer Pillow for image handling
+        if Image is None:
+            self.search_status.emit('Pillow not installed; thumbnails unavailable. Run: pip install Pillow')
+            # create empty file as placeholder
+            try:
+                with open(thumb_path, 'wb'):
+                    pass
+            except Exception:
+                pass
+            return thumb_path
+
+        try:
+            # Images / sequences
+            if file_info.get('is_sequence') or file_info['extension'] in self.IMAGE_EXTENSIONS:
+                try:
+                    src = Image.open(file_info['path'])
+                    src = src.convert('RGBA')
+                except Exception as e:
+                    print(f"Error opening image for thumbnail {file_info['path']}: {e}")
+                    return self.create_placeholder_thumbnail(thumb_path)
+
+            # Videos
+            elif file_info['extension'] in self.VIDEO_EXTENSIONS:
+                if cv2 is None:
+                    return self.create_placeholder_thumbnail(thumb_path)
+                try:
+                    cap = cv2.VideoCapture(file_info['path'])
+                    ok, frame = cap.read()
+                    cap.release()
+                    if not ok or frame is None:
+                        return self.create_placeholder_thumbnail(thumb_path)
+                    # convert BGR to RGB
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    src = Image.fromarray(frame).convert('RGBA')
+                except Exception as e:
+                    print(f"Error extracting video thumbnail {file_info['path']}: {e}")
+                    return self.create_placeholder_thumbnail(thumb_path)
+
+            else:
+                return self.create_placeholder_thumbnail(thumb_path)
+
+            # Resize to fit into thumb_size preserving aspect ratio
+            thumb_w, thumb_h = self.thumb_size
+            src.thumbnail((thumb_w, thumb_h), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+
+            # Create background and paste centered
+            background = Image.new('RGBA', self.thumb_size, (0, 0, 0, 0))
+            x = (thumb_w - src.width) // 2
+            y = (thumb_h - src.height) // 2
+            background.paste(src, (x, y), src)
+
+            # Apply rounded corners
+            final = self.apply_rounded_corners(background)
+
+            # Save PNG
+            final.save(thumb_path, format='PNG')
+            return thumb_path
+
+        except Exception as e:
+            print(f"Error generating thumbnail for {file_info['path']}: {e}")
+            return self.create_placeholder_thumbnail(thumb_path)
+
+    def is_sequence(self, file_name):
+        """Check if file looks like part of a sequence"""
+        sequence_pattern = r'^(.+?)[\._](\d{4,})(\.\w+)$'
+        return re.match(sequence_pattern, file_name) is not None
+
+    def scan_media_files(self):
+        """Recursively scan all folders and subfolders for media files"""
+        results = []
+        processed_sequences = set()
+
+        for root, dirs, files in os.walk(self.root_dir):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                file_ext = os.path.splitext(file_name)[1].lower()
+                
+                # Skip if not a media file
+                if file_ext not in self.ALL_MEDIA_EXTENSIONS:
+                    continue
+
+                # Skip if already processed as part of a sequence
+                if file_path in processed_sequences:
+                    continue
+
+                file_info = {
+                    'name': file_name,
+                    'path': file_path,
+                    'extension': file_ext,
+                    'resolution': None,
+                    'frame_count': None,
+                    'is_sequence': False,
+                    'file_size': os.path.getsize(file_path)
+                }
+
+                # Handle sequences
+                if file_ext in self.SEQUENCE_EXTENSIONS and self.is_sequence(file_name):
+                    resolution, frame_count, is_seq = self.get_sequence_info(file_path, file_name)
+                    if is_seq:
+                        file_info['resolution'] = resolution
+                        file_info['frame_count'] = frame_count
+                        file_info['is_sequence'] = True
+                        
+                        # Mark all frames in this sequence as processed
+                        directory = os.path.dirname(file_path)
+                        sequence_pattern = r'^(.+?)[\._](\d{4,})(\.\w+)$'
+                        match = re.match(sequence_pattern, file_name)
+                        if match:
+                            base_name = match.group(1)
+                            ext = match.group(3)
+                            for f in os.listdir(directory):
+                                if f.startswith(base_name) and f.endswith(ext):
+                                    processed_sequences.add(os.path.join(directory, f))
+                        
+                        results.append(file_info)
+                        # generate thumbnail
+                        file_info['thumbnail'] = self.generate_thumbnail(file_info)
+                        self.print_file_info(file_info)
+                        self.search_status.emit(f"Found sequence: {file_name} ({frame_count} frames, {resolution})")
+
+                # Handle videos
+                elif file_ext in self.VIDEO_EXTENSIONS:
+                    resolution, frame_count = self.get_video_info(file_path)
+                    file_info['resolution'] = resolution
+                    file_info['frame_count'] = frame_count
+                    results.append(file_info)
+                    # generate thumbnail
+                    file_info['thumbnail'] = self.generate_thumbnail(file_info)
+                    self.print_file_info(file_info)
+                    self.search_status.emit(f"Found video: {file_name} ({frame_count} frames, {resolution})")
+
+                # Handle static images
+                elif file_ext in self.IMAGE_EXTENSIONS:
+                    resolution = self.get_image_resolution(file_path)
+                    file_info['resolution'] = resolution
+                    file_info['frame_count'] = 1
+                    results.append(file_info)
+                    # generate thumbnail
+                    file_info['thumbnail'] = self.generate_thumbnail(file_info)
+                    self.print_file_info(file_info)
+                    self.search_status.emit(f"Found image: {file_name} ({resolution})")
+
+        return results
+
+    def print_file_info(self, file_info):
+        """Print formatted file information"""
+        is_seq = " [SEQUENCE]" if file_info['is_sequence'] else ""
+        frame_info = f", Frames: {file_info['frame_count']}" if file_info['frame_count'] else ""
+        resolution = f"{file_info['resolution'][0]}x{file_info['resolution'][1]}" if file_info['resolution'] else "Unknown"
+        
+        print(f"{'='*80}")
+        print(f"File Name: {file_info['name']}{is_seq}")
+        print(f"Full Path: {file_info['path']}")
+        print(f"Resolution: {resolution}")
+        print(f"Frames: {file_info['frame_count'] if file_info['frame_count'] else 'N/A'}")
+        print(f"{'='*80}")
+
+        self.create_widget.emit(file_info)
+
+    def run(self):
+        self.search_status.emit("Search started")
+        results = self.scan_media_files()
+        self.search_completed.emit(results)
+        self.search_status.emit(f"Search completed: Found {len(results)} media files")
+
+    def set_search_parameters(self, root_dir, query):
+        self.root_dir = root_dir
+        self.query = query
+        self.db_folder = os.path.join(root_dir, ".db")
+
